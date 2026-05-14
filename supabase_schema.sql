@@ -1,12 +1,9 @@
 -- ============================================================
--- ShelfMaster Database Schema
--- Run this once in your Supabase project's SQL Editor.
---
--- Authentication is handled entirely by Supabase Auth.
--- This file sets up application tables only.
+-- ShelfMaster Database Schema (Fully Fixed)
+-- Run this in Supabase SQL Editor
 -- ============================================================
 
--- 1. Books ────────────────────────────────────────────────────
+-- 1. Books
 CREATE TABLE IF NOT EXISTS public.books (
   id             text PRIMARY KEY,
   accession_num  text,
@@ -31,10 +28,10 @@ CREATE TABLE IF NOT EXISTS public.books (
   created_at     timestamptz DEFAULT now()
 );
 
--- 2. Users (public profile; auth_id links to Supabase Auth UUID) ──
+-- 2. Users
 CREATE TABLE IF NOT EXISTS public.users (
   id             text PRIMARY KEY,
-  auth_id        text UNIQUE,   -- Supabase Auth user id (uuid)
+  auth_id        text UNIQUE,
   name           text,
   student_id     text,
   course_year    text,
@@ -46,7 +43,7 @@ CREATE TABLE IF NOT EXISTS public.users (
   created_at     timestamptz DEFAULT now()
 );
 
--- 3. Book copies ───────────────────────────────────────────────
+-- 3. Book Copies
 CREATE TABLE IF NOT EXISTS public.book_copies (
   id             text PRIMARY KEY,
   book_id        text NOT NULL REFERENCES public.books(id) ON DELETE CASCADE,
@@ -57,10 +54,10 @@ CREATE TABLE IF NOT EXISTS public.book_copies (
   created_at     timestamptz DEFAULT now()
 );
 
--- 4. Fines (created before transactions to avoid circular FK) ──
+-- 4. Fines
 CREATE TABLE IF NOT EXISTS public.fines (
   id             text PRIMARY KEY,
-  transaction_id text,           -- FK added after transactions table exists
+  transaction_id text,
   user_id        text REFERENCES public.users(id) ON DELETE SET NULL,
   amount         numeric DEFAULT 0,
   status         text DEFAULT 'unpaid',
@@ -68,7 +65,7 @@ CREATE TABLE IF NOT EXISTS public.fines (
   paid_at        timestamptz
 );
 
--- 5. Transactions ─────────────────────────────────────────────
+-- 5. Transactions
 CREATE TABLE IF NOT EXISTS public.transactions (
   id                    text PRIMARY KEY,
   user_id               text REFERENCES public.users(id) ON DELETE SET NULL,
@@ -91,12 +88,28 @@ CREATE TABLE IF NOT EXISTS public.transactions (
   created_at            timestamptz DEFAULT now()
 );
 
--- Add the circular FK from fines → transactions (now that transactions exists)
-ALTER TABLE public.fines
-  ADD CONSTRAINT IF NOT EXISTS fines_transaction_id_fkey
-  FOREIGN KEY (transaction_id) REFERENCES public.transactions(id) ON DELETE SET NULL;
+-- 6. Circular Foreign Key (fines → transactions)
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 
+        FROM pg_constraint 
+        WHERE conname = 'fines_transaction_id_fkey'
+          AND conrelid = 'public.fines'::regclass
+    ) THEN
+        ALTER TABLE public.fines
+        ADD CONSTRAINT fines_transaction_id_fkey
+        FOREIGN KEY (transaction_id) 
+        REFERENCES public.transactions(id) 
+        ON DELETE SET NULL;
 
--- 6. Notifications ────────────────────────────────────────────
+        RAISE NOTICE '✅ Added constraint: fines_transaction_id_fkey';
+    ELSE
+        RAISE NOTICE '✅ Constraint fines_transaction_id_fkey already exists.';
+    END IF;
+END $$;
+
+-- 7. Notifications
 CREATE TABLE IF NOT EXISTS public.notifications (
   id             text PRIMARY KEY,
   user_id        text REFERENCES public.users(id) ON DELETE CASCADE,
@@ -110,7 +123,7 @@ CREATE TABLE IF NOT EXISTS public.notifications (
   created_at     timestamptz DEFAULT now()
 );
 
--- 7. Fine policy (single-row configuration) ───────────────────
+-- 8. Fine Policy
 CREATE TABLE IF NOT EXISTS public.fine_policy (
   id                integer PRIMARY KEY DEFAULT 1,
   fine_per_day      numeric DEFAULT 5,
@@ -120,7 +133,7 @@ CREATE TABLE IF NOT EXISTS public.fine_policy (
   max_borrow_count  integer DEFAULT 3
 );
 
--- 8. Site content (single-row configuration) ──────────────────
+-- 9. Site Content
 CREATE TABLE IF NOT EXISTS public.site_content (
   id                    integer PRIMARY KEY DEFAULT 1,
   hero_banner_url       text,
@@ -141,18 +154,30 @@ CREATE TABLE IF NOT EXISTS public.site_content (
   strands               text DEFAULT '["STEM","HUMSS","ABM","GAS","TVL - Industrial Arts","TVL - Home Economics","TVL - ICT","TVL - Agri-Fishery Arts","Sports","Arts & Design"]'
 );
 
--- ── Seed default single-row tables (idempotent) ───────────────
+-- Seed Default Data
 INSERT INTO public.fine_policy (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
 INSERT INTO public.site_content (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
 
--- ── Row Level Security ────────────────────────────────────────
--- The backend uses the service_role key which bypasses RLS.
--- Enable RLS so direct client-side queries can never bypass policies.
+-- Enable Row Level Security
 ALTER TABLE public.users          ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.books          ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.book_copies    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.transactions   ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.fines          ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.fine_policy    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.notifications  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.fine_policy    ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.site_content   ENABLE ROW LEVEL SECURITY;
+
+-- Create Useful Indexes
+CREATE INDEX IF NOT EXISTS idx_transactions_user_id ON public.transactions(user_id);
+CREATE INDEX IF NOT EXISTS idx_transactions_book_id ON public.transactions(book_id);
+CREATE INDEX IF NOT EXISTS idx_transactions_status ON public.transactions(status);
+CREATE INDEX IF NOT EXISTS idx_transactions_due_date ON public.transactions(due_date);
+CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON public.notifications(user_id);
+CREATE INDEX IF NOT EXISTS idx_fines_user_id ON public.fines(user_id);
+
+-- Final Success Message
+DO $$
+BEGIN
+    RAISE NOTICE '✅ ShelfMaster schema setup completed successfully!';
+END $$;
