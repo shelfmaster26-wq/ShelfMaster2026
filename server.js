@@ -58,7 +58,9 @@ const __httpServer = http.createServer(app);
 const port = Number(process.env.PORT || 5000);
 const isProduction = process.env.NODE_ENV === 'production';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const jwtSecret = process.env.JWT_SECRET || 'shelfmaster-local-dev-secret';
+const jwtSecret = process.env.JWT_SECRET || (isProduction
+  ? (() => { console.error('FATAL: JWT_SECRET env var is required in production.'); process.exit(1); })()
+  : 'shelfmaster-local-dev-secret');
 const APP_BASE_URL = (process.env.APP_BASE_URL || '').replace(/\/+$/, '');
 
 // ── Centralized error response ─────────────────────────────────────────────────
