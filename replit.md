@@ -1,45 +1,59 @@
-# [Project name]
+# ShelfMaster
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+A library management system for schools — handles book borrowing, returns, student accounts, librarian dashboard, fines, notifications, and eBook management.
 
 ## Run & Operate
 
-- `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
-- `pnpm run typecheck` — full typecheck across all packages
-- `pnpm run build` — typecheck + build all packages
-- `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
-- `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+- Frontend (ShelfMaster): workflow `artifacts/shelfmaster: web`
+- Backend (API Server): workflow `artifacts/api-server: API Server`
+- Required env: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `JWT_SECRET`
+- Optional email env: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`
 
 ## Stack
 
 - pnpm workspaces, Node.js 24, TypeScript 5.9
-- API: Express 5
-- DB: PostgreSQL + Drizzle ORM
-- Validation: Zod (`zod/v4`), `drizzle-zod`
-- API codegen: Orval (from OpenAPI spec)
-- Build: esbuild (CJS bundle)
+- Frontend: React 19 + Vite + React Router DOM (JSX components in `artifacts/shelfmaster/src/`)
+- Backend: Express 5 in `artifacts/api-server/` — proxies all Supabase queries and auth
+- Database: Supabase (Postgres) — schema in `.migration-backup/supabase_schema.sql`
+- Auth: Custom JWT via bcryptjs (stored in `auth_users` Supabase table)
+- Email: Nodemailer (console mode by default; set SMTP env vars for real delivery)
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- Frontend source: `artifacts/shelfmaster/src/` — JSX components, CSS in `index.css`
+- Backend routes: `artifacts/api-server/src/routes/shelfmaster.ts` — all API endpoints
+- Mailer: `artifacts/api-server/src/mailer.js`
+- DB client (frontend): `artifacts/shelfmaster/src/localDbClient.js` — wraps `/api/db/query`
+- Public assets: `artifacts/shelfmaster/public/` (logo, icons, library.jpg)
 
 ## Architecture decisions
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- Frontend calls the Replit proxy path `/api/*` (no hardcoded IP:port — connectionManager is stubbed out)
+- All Supabase access is server-side only; the frontend never holds service role keys
+- JWT tokens are stored in `sessionStorage` under `shelfmaster-session`
+- `localDbClient.js` mirrors the Supabase client API but routes through `/api/db/query`
+- The first user registered automatically becomes a librarian (bootstrap protection)
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+- Public homepage with library search and category browsing
+- Student portal: catalog, eBooks, borrowed books, profile
+- Librarian portal: inventory management, user management, borrowing requests, returns, fines, history, walk-in transactions, settings
+- Email notifications for verification, password reset, overdue books, borrow approvals/declines
 
 ## User preferences
 
-_Populate as you build — explicit user instructions worth remembering across sessions._
+- Keep JSX components as-is (`.jsx` files in `src/`)
+- Original ShelfMaster styling with Cormorant Garamond + DM Sans fonts
 
 ## Gotchas
 
-_Populate as you build — sharp edges, "always run X before Y" rules._
+- SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set for any data to load
+- The API server warns (but doesn't crash) if Supabase env vars are missing
+- Run `supabase_schema.sql` in the Supabase SQL Editor for first-time DB setup
+- `connectionManager.js` is stubbed — the app always uses relative `/api` paths
 
 ## Pointers
 
 - See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details
+- Supabase schema: `.migration-backup/supabase_schema.sql`
