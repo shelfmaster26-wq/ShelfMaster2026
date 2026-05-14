@@ -70,66 +70,20 @@ function serverError(res, err, status = 500) {
   res.status(status).json({ error: msg });
 }
 
-// ── CORS Configuration (Improved for Vercel) ───────────────────────────────
-const ALLOWED_ORIGINS = new Set(
-  (process.env.ALLOWED_ORIGINS || '').split(',').map(o => o.trim()).filter(Boolean)
+main.vercel.app
+const _allowedOrigins = new Set(
+  (process.env.ALLOWED_ORIGINS || '').split(',').map(o => o.trim()).filter(Boolean)
 );
-
-// Add common development origins
-const DEV_ORIGINS = new Set([
-  'http://localhost:5173',   // Vite default
-  'http://localhost:3000',
-  'http://localhost:5000',
-  'http://127.0.0.1:5173',
-]);
-
+const _localhostRe = /^https?://(localhost|127.0.0.1)(:\d+)?$/;
+const _replitDevDomain = process.env.REPLIT_DEV_DOMAIN || '';
 function isOriginAllowed(origin) {
-  if (!origin) return true;                    // Allow requests with no origin
-  
-  // Explicit allowlist (from env)
-  if (ALLOWED_ORIGINS.has(origin)) return true;
-
-  // Development origins
-  if (!isProduction && DEV_ORIGINS.has(origin)) return true;
-  
-  // Allow all localhost in development
-  if (!isProduction && origin.includes('localhost')) return true;
-  if (!isProduction && origin.includes('127.0.0.1')) return true;
-
-  // Allow Vercel preview domains (very useful)
-  if (origin.endsWith('.vercel.app')) return true;
-
-  // Allow Replit (if you still use it)
-  if (origin.includes('.replit.dev') || origin.includes(_replitDevDomain)) {
-    return true;
-  }
-
-  return false;
+  if (!origin) return true; // same-origin / server-to-server
+  if (_allowedOrigins.has(origin)) return true; // explicit allowlist
+  if (!isProduction && _localhostRe.test(origin)) return true; // localhost
+  if (!isProduction && _replitDevDomain && origin.includes(_replitDevDomain)) return true; // Replit dev
+  if (!isProduction && origin.includes('.replit.dev')) return true; // any Replit preview
+  return false;
 }
-
-// ── CORS Middleware ─────────────────────────────────────────────────────
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-
-  if (isOriginAllowed(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin || '*');
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
-  } else {
-    console.warn(`[CORS] Blocked origin: ${origin}`);
-    // Still respond to OPTIONS even if blocked (helps debugging)
-  }
-
-  res.setHeader('Vary', 'Origin');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
-
-  if (req.method === 'OPTIONS') {
-    res.status(204).end();
-    return;
-  }
-
-  next();
-});
 
 // ── Zod validation schemas ────────────────────────────────────────────────────
 const passwordSchema = z.string()
