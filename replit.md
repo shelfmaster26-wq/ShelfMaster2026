@@ -4,42 +4,40 @@ A library management system for schools — handles book borrowing, returns, stu
 
 ## Run & Operate
 
-- Frontend (ShelfMaster): workflow `artifacts/shelfmaster: web`
-- Backend (API Server): workflow `artifacts/api-server: API Server`
+- Dev: `npm run dev` (runs `node server.js` with Vite middleware — port 5000)
+- Build: `npm run build` (Vite build to `dist/`)
+- Production: `npm run start` (serves built `dist/` via Express)
 - Required env: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `JWT_SECRET`
 - Optional email env: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`
 
+## Vercel Deployment
+
+- `vercel.json` routes `/api/*` to the `api/index.js` serverless function
+- `api/index.js` re-exports the Express app from `server.js`
+- Frontend is a standard Vite build (`dist/` output)
+- Set `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `JWT_SECRET` in Vercel environment variables
+
 ## Stack
 
-- pnpm workspaces, Node.js 24, TypeScript 5.9
-- Frontend: React 19 + Vite + React Router DOM (JSX components in `artifacts/shelfmaster/src/`)
-- Backend: Express 5 in `artifacts/api-server/` — proxies all Supabase queries and auth
-- Database: Supabase (Postgres) — schema in `.migration-backup/supabase_schema.sql`
-- Auth: Custom JWT via bcryptjs (stored in `auth_users` Supabase table)
+- Node.js, Express 5 — combined dev server + API
+- React 19 + Vite — frontend (JSX, no TypeScript)
+- Supabase (Postgres) — database; schema in `supabase_schema.sql`
+- Auth: Custom JWT via bcryptjs (`auth_users` table)
 - Email: Nodemailer (console mode by default; set SMTP env vars for real delivery)
 
 ## Where things live
 
-- Frontend source: `artifacts/shelfmaster/src/` — JSX components, CSS in `index.css`
-- Backend routes: `artifacts/api-server/src/routes/shelfmaster.ts` — all API endpoints
-- Mailer: `artifacts/api-server/src/mailer.js`
-- DB client (frontend): `artifacts/shelfmaster/src/localDbClient.js` — wraps `/api/db/query`
-- Public assets: `artifacts/shelfmaster/public/` (logo, icons, library.jpg)
+- `src/` — all React JSX components and CSS
+- `server.js` — Express backend (auth, books, users, transactions, fines, notifications, eBooks)
+- `api/index.js` — Vercel serverless entry point (re-exports server.js)
+- `mailer.js` — Nodemailer email helper
+- `public/` — static assets (logo, icons, library.jpg)
+- `vercel.json` — Vercel deployment configuration
+- `supabase_schema.sql` — database schema (run in Supabase SQL Editor once)
 
-## Architecture decisions
+## First-time Database Setup
 
-- Frontend calls the Replit proxy path `/api/*` (no hardcoded IP:port — connectionManager is stubbed out)
-- All Supabase access is server-side only; the frontend never holds service role keys
-- JWT tokens are stored in `sessionStorage` under `shelfmaster-session`
-- `localDbClient.js` mirrors the Supabase client API but routes through `/api/db/query`
-- The first user registered automatically becomes a librarian (bootstrap protection)
-
-## Product
-
-- Public homepage with library search and category browsing
-- Student portal: catalog, eBooks, borrowed books, profile
-- Librarian portal: inventory management, user management, borrowing requests, returns, fines, history, walk-in transactions, settings
-- Email notifications for verification, password reset, overdue books, borrow approvals/declines
+Run `supabase_schema.sql` (or `setup_schema.sql` in `.migration-backup/`) in your Supabase project's SQL Editor. This creates all required tables in the correct order.
 
 ## User preferences
 
@@ -48,12 +46,6 @@ A library management system for schools — handles book borrowing, returns, stu
 
 ## Gotchas
 
-- SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set for any data to load
-- The API server warns (but doesn't crash) if Supabase env vars are missing
-- Run `supabase_schema.sql` in the Supabase SQL Editor for first-time DB setup
-- `connectionManager.js` is stubbed — the app always uses relative `/api` paths
-
-## Pointers
-
-- See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details
-- Supabase schema: `.migration-backup/supabase_schema.sql`
+- `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` must be set for any data to load
+- The server warns on startup if the Supabase tables don't exist yet
+- In dev, Vite middleware is used (HMR works); in production, `dist/` is served statically
