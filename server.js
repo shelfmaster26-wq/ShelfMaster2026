@@ -76,11 +76,14 @@ function serverError(res, err, status = 500) {
 const _allowedOrigins = new Set(
   (process.env.ALLOWED_ORIGINS || '').split(',').map(o => o.trim()).filter(Boolean)
 );
-const _localhostRe = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
+const _localhostRe    = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
+const _replitDevDomain = process.env.REPLIT_DEV_DOMAIN || '';
 function isOriginAllowed(origin) {
-  if (!origin) return true;                        // same-origin / server-to-server
-  if (_allowedOrigins.has(origin)) return true;   // explicit allowlist
-  if (!isProduction && _localhostRe.test(origin)) return true; // localhost in dev
+  if (!origin) return true;                         // same-origin / server-to-server
+  if (_allowedOrigins.has(origin)) return true;    // explicit allowlist
+  if (!isProduction && _localhostRe.test(origin)) return true;                        // localhost
+  if (!isProduction && _replitDevDomain && origin.includes(_replitDevDomain)) return true; // Replit dev
+  if (!isProduction && origin.includes('.replit.dev')) return true;  // any Replit preview
   return false;
 }
 
@@ -524,7 +527,12 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
 
     res.json({
       user: { id: sbUser.id, email: sbUser.email },
-      session: { access_token: sbData.access_token, user: { id: sbUser.id, email: sbUser.email } },
+      session: {
+        access_token:  sbData.access_token,
+        refresh_token: sbData.refresh_token,
+        expires_in:    sbData.expires_in,
+        user: { id: sbUser.id, email: sbUser.email },
+      },
     });
   } catch (error) {
     serverError(res, error);
@@ -614,6 +622,40 @@ app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
     if (updateErr) throw updateErr;
 
     res.json({ ok: true });
+  } catch (error) {
+    serverError(res, error);
+  }
+});
+
+// ── Session refresh ────────────────────────────────────────────────────────────
+// POST /api/auth/refresh
+// Body: { refresh_token: string }
+// Returns: { access_token, refresh_token, expires_in, token_type, user }
+app.post('/api/auth/refresh', authLimiter, async (req, res) => {
+  try {
+    const refresh_token = (req.body?.refresh_token || '').trim();
+    if (!refresh_token) {
+      res.status(400).json({ error: 'refresh_token is required.' });
+      return;
+    }
+
+    const result = await supabaseAuthFetch(
+      `/token?grant_type=refresh_token`,
+      { method: 'POST', body: { refresh_token } }
+    );
+
+    if (result.error) {
+      res.status(401).json({ error: result.error.message || 'Token refresh failed.' });
+      return;
+    }
+
+    res.json({
+      access_token:  result.access_token,
+      refresh_token: result.refresh_token,
+      expires_in:    result.expires_in,
+      token_type:    result.token_type,
+      user:          result.user ? { id: result.user.id, email: result.user.email } : null,
+    });
   } catch (error) {
     serverError(res, error);
   }

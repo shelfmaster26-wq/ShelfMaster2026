@@ -1,6 +1,8 @@
 import { getBaseURL } from './connectionManager';
 
 const SESSION_KEY = 'shelfmaster-session';
+// Refresh the token this many seconds before it actually expires.
+const REFRESH_BUFFER_SECS = 60;
 
 function buildUrl(url) {
   if (/^https?:\/\//i.test(url)) return url;
@@ -26,12 +28,80 @@ function setStoredSession(session) {
   }
 }
 
+// Decode a JWT payload (no signature verification — client-side only).
+function getTokenExpiry(token) {
+  try {
+    const payload = JSON.parse(atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
+    return typeof payload.exp === 'number' ? payload.exp : 0;
+  } catch {
+    return 0;
+  }
+}
+
+// True if the access_token is missing or will expire within REFRESH_BUFFER_SECS.
+function isTokenStale(session) {
+  if (!session?.access_token) return true;
+  const exp = session.expires_at ?? getTokenExpiry(session.access_token);
+  return exp > 0 && Date.now() / 1000 >= exp - REFRESH_BUFFER_SECS;
+}
+
+// Single in-flight refresh promise so concurrent requests don't all refresh at once.
+let _refreshPromise = null;
+
+async function refreshSession() {
+  const session = getStoredSession();
+  if (!session?.refresh_token) {
+    setStoredSession(null);
+    return null;
+  }
+
+  try {
+    const response = await fetch(buildUrl('/api/auth/refresh'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token: session.refresh_token }),
+    });
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok || !data.access_token) {
+      // Refresh failed — log the user out silently.
+      setStoredSession(null);
+      return null;
+    }
+
+    const newSession = {
+      ...session,
+      access_token:  data.access_token,
+      refresh_token: data.refresh_token ?? session.refresh_token,
+      expires_at:    data.expires_in ? Math.floor(Date.now() / 1000) + data.expires_in : 0,
+    };
+    setStoredSession(newSession);
+    return newSession;
+  } catch {
+    return null;
+  }
+}
+
+// Ensure only one refresh happens at a time (deduplicates concurrent calls).
+async function ensureFreshToken() {
+  const session = getStoredSession();
+  if (!isTokenStale(session)) return session;
+
+  if (!_refreshPromise) {
+    _refreshPromise = refreshSession().finally(() => { _refreshPromise = null; });
+  }
+  return _refreshPromise;
+}
+
 function getAuthHeader() {
   const session = getStoredSession();
   return session?.access_token ? { Authorization: `Bearer ${session.access_token}` } : {};
 }
 
 async function apiRequest(url, options = {}) {
+  // Auto-refresh the token before any authenticated request.
+  await ensureFreshToken();
+
   const response = await fetch(buildUrl(url), {
     ...options,
     headers: {
@@ -245,8 +315,15 @@ export const localDb = {
         return { data: { user: null, session: null }, error: result.error };
       }
 
-      setStoredSession(result.session);
-      return { data: { user: result.user, session: result.session }, error: null };
+      // Persist the session, including expires_at so auto-refresh knows when to act.
+      const session = {
+        ...result.session,
+        expires_at: result.session?.expires_in
+          ? Math.floor(Date.now() / 1000) + result.session.expires_in
+          : getTokenExpiry(result.session?.access_token ?? ''),
+      };
+      setStoredSession(session);
+      return { data: { user: result.user, session }, error: null };
     },
 
     signUp: async ({ email, password }) => {
