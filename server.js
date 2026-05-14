@@ -11,6 +11,8 @@ import { fileURLToPath } from 'node:url';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import compression from 'compression';
+import helmet from 'helmet';
+import { z } from 'zod';
 import { sendMail, htmlEmail, getMailerMode } from './mailer.js';
 
 // ── In-memory cache for rarely-changing tables ────────────────────────────────
@@ -30,9 +32,9 @@ function cacheInvalidate(prefix) {
 
 // ── Simple in-process rate limiter ────────────────────────────────────────────
 const _rl = new Map();
-function rateLimiter({ windowMs = 60_000, max = 120 } = {}) {
+function rateLimiter({ windowMs = 60_000, max = 120, keyPrefix = '' } = {}) {
   return (req, res, next) => {
-    const key = req.ip;
+    const key = keyPrefix + (req.ip || '');
     const now = Date.now();
     const rec = _rl.get(key);
     if (!rec || now > rec.resetAt) {
@@ -48,6 +50,9 @@ function rateLimiter({ windowMs = 60_000, max = 120 } = {}) {
   };
 }
 
+// Stricter limiter for auth endpoints — 10 attempts per 15 minutes per IP
+const authLimiter = rateLimiter({ windowMs: 15 * 60_000, max: 10, keyPrefix: 'auth:' });
+
 const app = express();
 const __httpServer = http.createServer(app);
 const port = Number(process.env.PORT || 5000);
@@ -55,6 +60,52 @@ const isProduction = process.env.NODE_ENV === 'production';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const jwtSecret = process.env.JWT_SECRET || 'shelfmaster-local-dev-secret';
 const APP_BASE_URL = (process.env.APP_BASE_URL || '').replace(/\/+$/, '');
+
+// ── Centralized error response ─────────────────────────────────────────────────
+// Never expose raw DB/library error messages to clients in production.
+function serverError(res, err, status = 500) {
+  const msg = isProduction ? 'An unexpected error occurred.' : (err?.message || String(err));
+  if (isProduction) console.error('[server error]', err?.message || err);
+  res.status(status).json({ error: msg });
+}
+
+// ── CORS origin allowlist ─────────────────────────────────────────────────────
+// Set ALLOWED_ORIGINS in env as a comma-separated list of Vercel deployment URLs.
+// e.g. ALLOWED_ORIGINS=https://shelfmaster.vercel.app,https://shelfmaster-git-main.vercel.app
+const _allowedOrigins = new Set(
+  (process.env.ALLOWED_ORIGINS || '').split(',').map(o => o.trim()).filter(Boolean)
+);
+const _localhostRe = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
+function isOriginAllowed(origin) {
+  if (!origin) return true;                        // same-origin / server-to-server
+  if (_allowedOrigins.has(origin)) return true;   // explicit allowlist
+  if (!isProduction && _localhostRe.test(origin)) return true; // localhost in dev
+  return false;
+}
+
+// ── Zod validation schemas ────────────────────────────────────────────────────
+const passwordSchema = z.string()
+  .min(8, 'Password must be at least 8 characters.')
+  .max(128, 'Password is too long.')
+  .regex(/[A-Z]/, 'Password must contain at least one uppercase letter.')
+  .regex(/[a-z]/, 'Password must contain at least one lowercase letter.')
+  .regex(/[0-9]/, 'Password must contain at least one number.');
+
+const signupSchema = z.object({
+  email:    z.string().email('Invalid email address.').max(255),
+  password: passwordSchema,
+});
+const loginSchema = z.object({
+  email:    z.string().email('Invalid email address.').max(255),
+  password: z.string().min(1).max(128),
+});
+const forgotPasswordSchema = z.object({
+  email: z.string().email('Invalid email address.').max(255),
+});
+const resetPasswordSchema = z.object({
+  token:    z.string().min(1).max(128),
+  password: passwordSchema,
+});
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -77,23 +128,79 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 // Allow-list of tables clients may query through /api/db/query.
 const ALLOWED_TABLES = new Set(['users', 'books', 'book_copies', 'transactions', 'fines', 'fine_policy', 'site_content', 'notifications']);
 
+// Allow-list of columns per table — prevents arbitrary column access via /api/db/query.
+const TABLE_COLUMNS = {
+  users:        ['id','auth_id','name','student_id','course_year','grade_section','lrn','role','status','archived_at','created_at'],
+  books:        ['id','accession_num','barcode','title','authors','quantity','date_acquired','edition','pages','book_type','subject_class','category','cost_price','publisher','isbn','copyright','source','remark','status','cover_image','created_at'],
+  book_copies:  ['id','book_id','copy_number','accession_id','status','date_acquired','created_at'],
+  transactions: ['id','user_id','book_id','copy_id','status','borrow_date','due_date','return_date','fine_amount','walk_in_name','walk_in_grade_section','walk_in_lrn','walk_in_teacher','walk_in_employee_id','walk_in_department','walk_in_contact','walk_in_position','created_at','fine_id'],
+  fines:        ['id','transaction_id','user_id','amount','status','created_at','paid_at'],
+  fine_policy:  ['id','fine_per_day','grace_period_days','max_fine','max_borrow_days','max_borrow_count'],
+  site_content: ['id','hero_banner_url','tagline','about_text','mission','vision','contact_email','contact_phone','contact_location','footer_text','borrow_duration_value','borrow_duration_unit','fine_per_day','fine_amount','fine_increment_value','fine_increment_type','strands'],
+  notifications:['id','user_id','type','title','body','email_sent','read','created_at','fine_id','transaction_id'],
+};
+
+// Allowed MIME types and extensions for book cover uploads.
+const ALLOWED_UPLOAD_MIME = new Set(['image/jpeg','image/png','image/webp','image/gif']);
+const ALLOWED_UPLOAD_EXT  = new Set(['.jpg','.jpeg','.png','.webp','.gif']);
+const MAX_UPLOAD_BYTES = 4 * 1024 * 1024; // 4 MB decoded
+
+// Safe characters for Supabase select strings (columns, joins, aliases).
+const SAFE_SELECT_RE = /^[\w\s,.*()!\-:]+$/;
+
+function assertColumns(table, payload) {
+  const allowed = TABLE_COLUMNS[table];
+  if (!allowed) return;
+  for (const key of Object.keys(payload || {})) {
+    if (!allowed.includes(key)) throw new Error(`Column '${key}' is not allowed on table '${table}'.`);
+  }
+}
+
+function assertFilterColumns(table, filters) {
+  const allowed = TABLE_COLUMNS[table];
+  if (!allowed) return;
+  for (const f of (filters || [])) {
+    if (f?.column && !allowed.includes(f.column))
+      throw new Error(`Filter column '${f.column}' is not allowed on table '${table}'.`);
+  }
+}
+
+function sanitizeSelect(select) {
+  if (!select || select === '*') return select || '*';
+  if (!SAFE_SELECT_RE.test(select)) throw new Error('Invalid select expression.');
+  return select;
+}
+
 // ── Gzip all responses ────────────────────────────────────────────────────────
 app.use(compression());
+
+// ── Security headers via Helmet ───────────────────────────────────────────────
+app.use(helmet({
+  contentSecurityPolicy: false, // Vite/React manages its own CSP in dev
+  crossOriginResourcePolicy: { policy: 'cross-origin' }, // allow public assets
+}));
 
 // ── Rate limiter: 120 requests/min per IP ─────────────────────────────────────
 app.use(rateLimiter({ windowMs: 60_000, max: 120 }));
 
-app.use(express.json({ limit: '15mb' }));
+app.use(express.json({ limit: '5mb' }));
 
-// CORS — allow LAN devices on a different origin to call this server's API.
+// ── CORS — restricted to allowlisted origins ──────────────────────────────────
 app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
-  res.setHeader('Vary', 'Origin');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  const origin = req.headers.origin || '';
+  if (isOriginAllowed(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin || '*');
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
   if (req.method === 'OPTIONS') {
     res.status(204).end();
+    return;
+  }
+  if (!isOriginAllowed(origin)) {
+    res.status(403).json({ error: 'Origin not allowed.' });
     return;
   }
   next();
@@ -125,6 +232,7 @@ function cleanValue(value) {
 }
 
 function cleanPayload(table, payload) {
+  assertColumns(table, payload);
   const cleaned = {};
   for (const [key, value] of Object.entries(payload || {})) {
     cleaned[key] = cleanValue(value);
@@ -167,9 +275,11 @@ function applyFilters(query, filters = []) {
 }
 
 async function selectRows({ table, select, filters, order, limit, options, single, maybeSingle }) {
+  assertFilterColumns(table, filters);
+  const safeSelect = sanitizeSelect(select);
   const wantsCount = options?.count;
   const headOnly = !!options?.head;
-  const selectArgs = [select && select.length ? select : '*'];
+  const selectArgs = [safeSelect && safeSelect.length ? safeSelect : '*'];
   if (wantsCount || headOnly) {
     selectArgs.push({ count: wantsCount || 'exact', head: headOnly });
   }
@@ -278,7 +388,7 @@ app.get('/api/health', async (_req, res) => {
     if (error && error.code !== 'PGRST116') throw error;
     res.json({ ok: true, database: 'supabase' });
   } catch (error) {
-    res.status(500).json({ ok: false, error: error.message });
+    serverError(res, error);
   }
 });
 
@@ -299,15 +409,15 @@ function buildVerifyUrl(req, token) {
   return `${base}/verify?token=${encodeURIComponent(token)}`;
 }
 
-app.post('/api/auth/signup', async (req, res) => {
+app.post('/api/auth/signup', authLimiter, async (req, res) => {
   try {
-    const email = String(req.body?.email || '').trim().toLowerCase();
-    const password = String(req.body?.password || '');
-
-    if (!email || !password) {
-      res.status(400).json({ error: 'Email and password are required.' });
+    const parsed = signupSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0].message });
       return;
     }
+    const email    = parsed.data.email.trim().toLowerCase();
+    const password = parsed.data.password;
 
     const { data: existing } = await supabase
       .from('auth_users')
@@ -369,14 +479,19 @@ app.post('/api/auth/signup', async (req, res) => {
       verifyUrl: getMailerMode() === 'console' && !isAdminEmail ? verifyUrl : null,
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    serverError(res, error);
   }
 });
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', authLimiter, async (req, res) => {
   try {
-    const email = String(req.body?.email || '').trim().toLowerCase();
-    const password = String(req.body?.password || '');
+    const parsed = loginSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0].message });
+      return;
+    }
+    const email    = parsed.data.email.trim().toLowerCase();
+    const password = parsed.data.password;
 
     const { data: authUser, error } = await supabase
       .from('auth_users')
@@ -416,12 +531,12 @@ app.post('/api/auth/login', async (req, res) => {
       session: { access_token: token, user: { id: authUser.id, email: authUser.email } },
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    serverError(res, error);
   }
 });
 
 // Consumes the verification token sent in the signup email.
-app.post('/api/auth/verify', async (req, res) => {
+app.post('/api/auth/verify', authLimiter, async (req, res) => {
   try {
     const token = String(req.body?.token || '').trim();
     if (!token) { res.status(400).json({ error: 'Missing token.' }); return; }
@@ -443,12 +558,12 @@ app.post('/api/auth/verify', async (req, res) => {
 
     res.json({ ok: true, email: row.email });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    serverError(res, error);
   }
 });
 
 // Re-sends the verification email if the user lost it.
-app.post('/api/auth/resend-verification', async (req, res) => {
+app.post('/api/auth/resend-verification', authLimiter, async (req, res) => {
   try {
     const email = String(req.body?.email || '').trim().toLowerCase();
     if (!email) { res.status(400).json({ error: 'Email required.' }); return; }
@@ -487,15 +602,16 @@ app.post('/api/auth/resend-verification', async (req, res) => {
 
     res.json({ ok: true, mailer: getMailerMode(), verifyUrl: getMailerMode() === 'console' ? verifyUrl : null });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    serverError(res, error);
   }
 });
 
 // Sends a password reset email with a time-limited token.
-app.post('/api/auth/forgot-password', async (req, res) => {
+app.post('/api/auth/forgot-password', authLimiter, async (req, res) => {
   try {
-    const email = String(req.body?.email || '').trim().toLowerCase();
-    if (!email) { res.status(400).json({ error: 'Email is required.' }); return; }
+    const parsed = forgotPasswordSchema.safeParse(req.body);
+    if (!parsed.success) { res.status(400).json({ error: parsed.error.issues[0].message }); return; }
+    const email = parsed.data.email.trim().toLowerCase();
 
     const { data: row } = await supabase
       .from('auth_users')
@@ -539,18 +655,17 @@ app.post('/api/auth/forgot-password', async (req, res) => {
 
     res.json({ ok: true, mailer: getMailerMode(), resetUrl: getMailerMode() === 'console' ? resetUrl : null });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    serverError(res, error);
   }
 });
 
 // Validates the reset token and updates the password.
-app.post('/api/auth/reset-password', async (req, res) => {
+app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
   try {
-    const token    = String(req.body?.token    || '').trim();
-    const password = String(req.body?.password || '');
-    if (!token)    { res.status(400).json({ error: 'Reset token is required.' }); return; }
-    if (!password) { res.status(400).json({ error: 'New password is required.' }); return; }
-    if (password.length < 6) { res.status(400).json({ error: 'Password must be at least 6 characters.' }); return; }
+    const parsed = resetPasswordSchema.safeParse(req.body);
+    if (!parsed.success) { res.status(400).json({ error: parsed.error.issues[0].message }); return; }
+    const token    = parsed.data.token.trim();
+    const password = parsed.data.password;
 
     const { data: row } = await supabase
       .from('auth_users')
@@ -572,7 +687,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
 
     res.json({ ok: true });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    serverError(res, error);
   }
 });
 
@@ -623,7 +738,9 @@ app.post('/api/db/query', async (req, res) => {
 
     res.json(result);
   } catch (error) {
-    res.json({ data: null, error: { message: error.message }, count: 0 });
+    const msg = isProduction ? 'Database query failed.' : error.message;
+    if (isProduction) console.error('[db/query error]', error.message);
+    res.json({ data: null, error: { message: msg }, count: 0 });
   }
 });
 
@@ -649,7 +766,7 @@ app.post('/api/books/:id/archive', async (req, res) => {
     if (error) throw error;
     res.json({ ok: true });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    serverError(res, error);
   }
 });
 
@@ -660,7 +777,7 @@ app.post('/api/books/:id/unarchive', async (req, res) => {
     if (error) throw error;
     res.json({ ok: true });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    serverError(res, error);
   }
 });
 
@@ -671,7 +788,7 @@ app.delete('/api/books/:id', async (req, res) => {
     if (error) throw error;
     res.json({ ok: true });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    serverError(res, error);
   }
 });
 
@@ -686,7 +803,7 @@ app.post('/api/users/:id/archive', async (req, res) => {
     if (error) throw error;
     res.json({ ok: true });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    serverError(res, error);
   }
 });
 
@@ -700,7 +817,7 @@ app.post('/api/users/:id/unarchive', async (req, res) => {
     if (error) throw error;
     res.json({ ok: true });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    serverError(res, error);
   }
 });
 
@@ -724,7 +841,7 @@ app.delete('/api/users/:id', async (req, res) => {
     }
     res.json({ ok: true });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    serverError(res, error);
   }
 });
 
@@ -781,7 +898,7 @@ app.post('/api/notifications', async (req, res) => {
 
     res.json({ ok: true, id, email_sent: emailSent, mailer: getMailerMode() });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    serverError(res, error);
   }
 });
 
@@ -852,7 +969,7 @@ app.post('/api/notify/librarians', async (req, res) => {
 
     res.json({ ok: true, sent, mailer: getMailerMode() });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    serverError(res, error);
   }
 });
 
@@ -899,7 +1016,7 @@ app.post('/api/ebooks', async (req, res) => {
 
     res.json({ ok: true, ebook: inserted });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    serverError(res, error);
   }
 });
 
@@ -924,7 +1041,7 @@ app.patch('/api/ebooks/:id', async (req, res) => {
 
     res.json({ ok: true });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    serverError(res, error);
   }
 });
 
@@ -932,17 +1049,32 @@ app.post('/api/storage/upload', async (req, res) => {
   if (!(await requireLibrarian(req, res))) return;
 
   try {
-    const uploadPath = String(req.body?.path || '').replace(/^\/+/, '');
-    const dataUrl = String(req.body?.dataUrl || '');
-    const match = dataUrl.match(/^data:(.+);base64,(.+)$/);
+    const rawPath  = String(req.body?.path || '').replace(/^\/+/, '');
+    const dataUrl  = String(req.body?.dataUrl || '');
+    const match    = dataUrl.match(/^data:([^;]+);base64,(.+)$/s);
 
-    if (!uploadPath || !match || uploadPath.includes('..')) {
-      res.status(400).json({ error: 'Invalid upload.' });
+    if (!rawPath || !match || rawPath.includes('..') || rawPath.includes('/./')) {
+      res.status(400).json({ error: 'Invalid upload path.' });
       return;
     }
 
-    const mimeType = match[1];
+    const mimeType = match[1].toLowerCase();
+    if (!ALLOWED_UPLOAD_MIME.has(mimeType)) {
+      res.status(400).json({ error: 'File type not allowed. Use JPEG, PNG, WebP, or GIF.' });
+      return;
+    }
+
+    // Sanitize filename — keep only safe characters, force allowed extension.
+    const rawExt  = path.extname(rawPath).toLowerCase();
+    const ext     = ALLOWED_UPLOAD_EXT.has(rawExt) ? rawExt : '.' + mimeType.split('/')[1];
+    const safeName = path.basename(rawPath, rawExt).replace(/[^\w\-]/g, '_').slice(0, 80) + ext;
+    const uploadPath = safeName;
+
     const buffer = Buffer.from(match[2], 'base64');
+    if (buffer.length > MAX_UPLOAD_BYTES) {
+      res.status(413).json({ error: 'Image exceeds the 4 MB limit.' });
+      return;
+    }
 
     const { error: uploadError } = await supabase.storage
       .from('book-covers')
@@ -956,7 +1088,7 @@ app.post('/api/storage/upload', async (req, res) => {
 
     res.json({ ok: true, publicUrl });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    serverError(res, error);
   }
 });
 
@@ -1076,8 +1208,15 @@ app.post('/api/admin/overdue-notify', async (req, res) => {
     res.json({ ok: true, ...result });
   } catch (err) {
     console.error('[overdue-notify] Unhandled error:', err.message);
-    res.status(500).json({ ok: false, error: err.message });
+    serverError(res, err);
   }
+});
+
+// ── Global Express error handler ──────────────────────────────────────────────
+// Catches any error passed via next(err) from route handlers.
+// eslint-disable-next-line no-unused-vars
+app.use((err, _req, res, _next) => {
+  serverError(res, err);
 });
 
 // On Vercel, the frontend is served by the CDN — don't add any middleware.
