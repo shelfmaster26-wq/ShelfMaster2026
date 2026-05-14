@@ -1,7 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
 import http from 'node:http';
-import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
 import { createClient } from '@supabase/supabase-js';
@@ -126,6 +125,22 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
   realtime: { transport: WebSocket },
 });
+
+// Helper: direct HTTP request to Supabase Auth REST API.
+// Uses the service-role key — server-side only, never sent to the browser.
+async function supabaseAuthFetch(path, options = {}) {
+  const url = `${SUPABASE_URL}/auth/v1${path}`;
+  const resp = await fetch(url, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      ...(options.headers || {}),
+    },
+  });
+  const data = await resp.json().catch(() => ({}));
+  return { ok: resp.ok, status: resp.status, data };
+}
 
 // Allow-list of tables clients may query through /api/db/query.
 const ALLOWED_TABLES = new Set(['users', 'books', 'book_copies', 'transactions', 'fines', 'fine_policy', 'site_content', 'notifications']);
@@ -358,7 +373,9 @@ async function getUserFromRequest(req) {
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
   if (!token) return null;
   try {
-    return jwt.verify(token, jwtSecret);
+    const payload = jwt.verify(token, jwtSecret);
+    // Supabase JWTs use 'sub' for the user UUID; normalise to always expose 'id'.
+    return { ...payload, id: payload.sub ?? payload.id };
   } catch {
     return null;
   }
@@ -406,11 +423,9 @@ app.get('/api/lan-info', (_req, res) => {
   res.json({ port, addresses: getLanAddresses() });
 });
 
-function buildVerifyUrl(req, token) {
-  const base = APP_BASE_URL || `${req.protocol}://${req.get('host')}`;
-  return `${base}/verify?token=${encodeURIComponent(token)}`;
-}
-
+// Creates a new account in Supabase Auth.
+// Supabase sends the verification email automatically (configured via Auth → Email Templates).
+// The mailer is NOT used for auth emails — only for library notifications.
 app.post('/api/auth/signup', authLimiter, async (req, res) => {
   try {
     const parsed = signupSchema.safeParse(req.body);
@@ -421,70 +436,51 @@ app.post('/api/auth/signup', authLimiter, async (req, res) => {
     const email    = parsed.data.email.trim().toLowerCase();
     const password = parsed.data.password;
 
-    const { data: existing } = await supabase
-      .from('auth_users')
-      .select('id')
-      .eq('email', email)
-      .maybeSingle();
-    if (existing) {
-      res.status(400).json({ error: 'An account with that email already exists.' });
-      return;
-    }
-
-    // shelfmaster26@gmail.com is the designated librarian account —
-    // it is auto-verified and does not need an email confirmation link.
+    // shelfmaster26@gmail.com is the designated librarian account — auto-confirmed.
     const ADMIN_EMAIL = 'shelfmaster26@gmail.com';
     const isAdminEmail = email === ADMIN_EMAIL;
 
-    const id = uuidv4();
-    const passwordHash = await bcrypt.hash(password, 10);
-    const verificationToken = isAdminEmail ? null : crypto.randomBytes(24).toString('hex');
+    // Create the user in Supabase Auth.
+    const { data: sbData, error: createErr } = await supabase.auth.admin.createUser({
+      email,
+      password,
+      email_confirm: isAdminEmail, // auto-confirm admin; others must verify via email
+    });
+    if (createErr) {
+      const msg = createErr.message || '';
+      if (msg.toLowerCase().includes('already registered') ||
+          msg.toLowerCase().includes('already exists') ||
+          msg.toLowerCase().includes('unique')) {
+        res.status(400).json({ error: 'An account with that email already exists.' });
+        return;
+      }
+      throw createErr;
+    }
 
-    const { error } = await supabase
-      .from('auth_users')
-      .insert({
-        id,
-        email,
-        password_hash: passwordHash,
-        verified: isAdminEmail,
-        verification_token: verificationToken,
-      });
-    if (error) throw error;
+    const authId = sbData.user.id;
 
-    let verifyUrl = null;
+    // For regular users, trigger Supabase's own verification email.
     if (!isAdminEmail) {
-      verifyUrl = buildVerifyUrl(req, verificationToken);
-      await sendMail({
-        to: email,
-        subject: 'Confirm your ShelfMaster account',
-        html: htmlEmail({
-          type: 'verify',
-          heading: 'Welcome to ShelfMaster!',
-          body: `Thank you for registering. To activate your account and start accessing the library system, please confirm your email address by clicking the button below.
-                 <br><br>
-                 If you did not create an account, you can safely ignore this email.
-                 <br><br>
-                 <span style="color:#94a3b8;font-size:12px">Button not working? Copy and paste this link into your browser:<br>
-                 <span style="color:#0369a1;word-break:break-all">${verifyUrl}</span></span>`,
-          ctaUrl: verifyUrl,
-          ctaLabel: 'Verify My Email Address',
-        }),
-        text: `Welcome to ShelfMaster!\n\nPlease confirm your email address by visiting:\n${verifyUrl}\n\nIf you did not create an account, ignore this email.`,
+      const base = APP_BASE_URL || `${req.protocol}://${req.get('host')}`;
+      const redirectTo = `${base}/verify`;
+      // Supabase resend sends the confirmation email with the redirect baked in.
+      await supabaseAuthFetch(`/resend?redirect_to=${encodeURIComponent(redirectTo)}`, {
+        method: 'POST',
+        body: JSON.stringify({ type: 'signup', email }),
       });
     }
 
     res.json({
-      user: { id, email },
+      user: { id: authId, email },
       verified: isAdminEmail,
       isAdmin: isAdminEmail,
-      mailer: getMailerMode(),
-      verifyUrl: getMailerMode() === 'console' && !isAdminEmail ? verifyUrl : null,
     });
   } catch (error) {
     serverError(res, error);
   }
 });
 
+// Sign-in via Supabase Auth — verifies credentials and returns a Supabase JWT.
 app.post('/api/auth/login', authLimiter, async (req, res) => {
   try {
     const parsed = loginSchema.safeParse(req.body);
@@ -495,173 +491,102 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     const email    = parsed.data.email.trim().toLowerCase();
     const password = parsed.data.password;
 
-    const { data: authUser, error } = await supabase
-      .from('auth_users')
-      .select('*')
-      .eq('email', email)
-      .maybeSingle();
+    const { ok, data: sbData } = await supabaseAuthFetch('/token?grant_type=password', {
+      method: 'POST',
+      body: JSON.stringify({ email, password }),
+    });
 
-    if (error) throw error;
-
-    if (!authUser || !(await bcrypt.compare(password, authUser.password_hash))) {
+    if (!ok) {
+      const msg = sbData?.error_description || sbData?.msg || sbData?.error || '';
+      if (msg.toLowerCase().includes('email not confirmed')) {
+        res.status(403).json({
+          error: 'Please verify your email address before signing in. Check your inbox for the confirmation link.',
+          code: 'email_not_verified',
+        });
+        return;
+      }
       res.status(401).json({ error: 'Invalid login credentials' });
       return;
     }
 
-    if (authUser.verified === false) {
-      res.status(403).json({
-        error: 'Please verify your email address before signing in. Check your inbox for the confirmation link.',
-        code: 'email_not_verified',
-      });
-      return;
-    }
+    const sbUser = sbData.user;
 
     // Reject login for archived user accounts.
     const { data: profile } = await supabase
       .from('users')
       .select('archived_at')
-      .eq('auth_id', authUser.id)
+      .eq('auth_id', sbUser.id)
       .maybeSingle();
     if (profile?.archived_at) {
       res.status(403).json({ error: 'This account has been archived. Please contact a librarian.' });
       return;
     }
 
-    const token = jwt.sign({ id: authUser.id, email: authUser.email }, jwtSecret, { expiresIn: '7d' });
     res.json({
-      user: { id: authUser.id, email: authUser.email },
-      session: { access_token: token, user: { id: authUser.id, email: authUser.email } },
+      user: { id: sbUser.id, email: sbUser.email },
+      session: { access_token: sbData.access_token, user: { id: sbUser.id, email: sbUser.email } },
     });
   } catch (error) {
     serverError(res, error);
   }
 });
 
-// Consumes the verification token sent in the signup email.
-app.post('/api/auth/verify', authLimiter, async (req, res) => {
-  try {
-    const token = String(req.body?.token || '').trim();
-    if (!token) { res.status(400).json({ error: 'Missing token.' }); return; }
-
-    const { data: row, error } = await supabase
-      .from('auth_users')
-      .select('id, email, verified')
-      .eq('verification_token', token)
-      .maybeSingle();
-    if (error) throw error;
-    if (!row) { res.status(400).json({ error: 'Invalid or expired verification link.' }); return; }
-    if (row.verified) { res.json({ ok: true, alreadyVerified: true, email: row.email }); return; }
-
-    const { error: updErr } = await supabase
-      .from('auth_users')
-      .update({ verified: true, verification_token: null })
-      .eq('id', row.id);
-    if (updErr) throw updErr;
-
-    res.json({ ok: true, email: row.email });
-  } catch (error) {
-    serverError(res, error);
-  }
+// Email verification is handled entirely by Supabase.
+// When the user clicks the link in the email, Supabase verifies the token server-side
+// and redirects to /verify#access_token=...&type=signup — no server call needed.
+// This endpoint exists only for backwards compatibility with the frontend client.
+app.post('/api/auth/verify', authLimiter, async (_req, res) => {
+  res.json({ ok: true });
 });
 
-// Re-sends the verification email if the user lost it.
+// Re-sends the Supabase verification email.
+// Supabase sends the email via its own email service — the mailer is not used.
 app.post('/api/auth/resend-verification', authLimiter, async (req, res) => {
   try {
     const email = String(req.body?.email || '').trim().toLowerCase();
     if (!email) { res.status(400).json({ error: 'Email required.' }); return; }
 
-    const { data: row } = await supabase
-      .from('auth_users')
-      .select('id, email, verified, verification_token')
-      .eq('email', email)
-      .maybeSingle();
-    if (!row) { res.json({ ok: true }); return; } // don't leak existence
-    if (row.verified) { res.json({ ok: true, alreadyVerified: true }); return; }
+    const base = APP_BASE_URL || `${req.protocol}://${req.get('host')}`;
+    const redirectTo = `${base}/verify`;
 
-    const token = row.verification_token || crypto.randomBytes(24).toString('hex');
-    if (!row.verification_token) {
-      await supabase.from('auth_users').update({ verification_token: token }).eq('id', row.id);
-    }
-
-    const verifyUrl = buildVerifyUrl(req, token);
-    await sendMail({
-      to: email,
-      subject: 'Confirm your ShelfMaster account',
-      html: htmlEmail({
-        type: 'verify',
-        heading: 'Confirm Your Email Address',
-        body: `We received a request to resend your account verification link. Click the button below to confirm your email address and activate your ShelfMaster account.
-               <br><br>
-               If you did not request this, you can safely ignore this email — your account will remain unverified.
-               <br><br>
-               <span style="color:#94a3b8;font-size:12px">Button not working? Copy and paste this link into your browser:<br>
-               <span style="color:#0369a1;word-break:break-all">${verifyUrl}</span></span>`,
-        ctaUrl: verifyUrl,
-        ctaLabel: 'Verify My Email Address',
-      }),
-      text: `Confirm your ShelfMaster email address by visiting:\n${verifyUrl}\n\nIf you did not request this, ignore this email.`,
+    await supabaseAuthFetch(`/resend?redirect_to=${encodeURIComponent(redirectTo)}`, {
+      method: 'POST',
+      body: JSON.stringify({ type: 'signup', email }),
     });
 
-    res.json({ ok: true, mailer: getMailerMode(), verifyUrl: getMailerMode() === 'console' ? verifyUrl : null });
+    // Always respond ok — don't leak whether an account exists.
+    res.json({ ok: true });
   } catch (error) {
     serverError(res, error);
   }
 });
 
-// Sends a password reset email with a time-limited token.
+// Triggers Supabase's built-in password reset email.
+// Supabase sends the email — the mailer is not used for this.
 app.post('/api/auth/forgot-password', authLimiter, async (req, res) => {
   try {
     const parsed = forgotPasswordSchema.safeParse(req.body);
     if (!parsed.success) { res.status(400).json({ error: parsed.error.issues[0].message }); return; }
     const email = parsed.data.email.trim().toLowerCase();
 
-    const { data: row } = await supabase
-      .from('auth_users')
-      .select('id, email')
-      .eq('email', email)
-      .maybeSingle();
-
-    // Always respond the same way — don't leak whether the email exists
-    if (!row) { res.json({ ok: true }); return; }
-
-    const token = crypto.randomBytes(32).toString('hex');
-    const expires = new Date(Date.now() + 60 * 60 * 1000).toISOString(); // 1 hour
-
-    await supabase.from('auth_users').update({
-      reset_token: token,
-      reset_token_expires: expires,
-    }).eq('id', row.id);
-
     const base = APP_BASE_URL || `${req.protocol}://${req.get('host')}`;
-    const resetUrl = `${base}/reset-password?token=${token}`;
+    const resetUrl = `${base}/reset-password`;
 
-    await sendMail({
-      to: email,
-      subject: 'Reset your ShelfMaster password',
-      html: htmlEmail({
-        type: 'reset',
-        heading: 'Password Reset Request',
-        body: `We received a request to reset the password for the ShelfMaster account associated with this email address.
-               <br><br>
-               Click the button below to choose a new password. For your security, this link will expire in <strong style="color:#b45309">1 hour</strong>.
-               <br><br>
-               If you did not request a password reset, no action is needed — your current password will remain unchanged and this link will expire automatically.
-               <br><br>
-               <span style="color:#94a3b8;font-size:12px">Button not working? Copy and paste this link into your browser:<br>
-               <span style="color:#0369a1;word-break:break-all">${resetUrl}</span></span>`,
-        ctaUrl: resetUrl,
-        ctaLabel: 'Reset My Password',
-      }),
-      text: `Reset your ShelfMaster password by visiting:\n${resetUrl}\n\nThis link expires in 1 hour. If you did not request a reset, ignore this email.`,
+    // Supabase emails the user a recovery link that redirects to /reset-password#access_token=...
+    await supabaseAuthFetch('/recover', {
+      method: 'POST',
+      body: JSON.stringify({ email, redirect_to: resetUrl }),
     });
 
-    res.json({ ok: true, mailer: getMailerMode(), resetUrl: getMailerMode() === 'console' ? resetUrl : null });
+    // Always respond the same way — don't leak whether the email exists.
+    res.json({ ok: true });
   } catch (error) {
     serverError(res, error);
   }
 });
 
-// Validates the reset token and updates the password.
+// Verifies the Supabase recovery JWT and updates the password via the Admin API.
+// The token is the access_token from the recovery hash fragment (#access_token=...&type=recovery).
 app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
   try {
     const parsed = resetPasswordSchema.safeParse(req.body);
@@ -669,23 +594,24 @@ app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
     const token    = parsed.data.token.trim();
     const password = parsed.data.password;
 
-    const { data: row } = await supabase
-      .from('auth_users')
-      .select('id, reset_token_expires')
-      .eq('reset_token', token)
-      .maybeSingle();
-
-    if (!row) { res.status(400).json({ error: 'Invalid or expired reset link. Please request a new one.' }); return; }
-    if (row.reset_token_expires && new Date(row.reset_token_expires) < new Date()) {
-      res.status(400).json({ error: 'This reset link has expired. Please request a new one.' }); return;
+    // Verify the Supabase recovery JWT (signed with the same JWT_SECRET).
+    let userId;
+    try {
+      const payload = jwt.verify(token, jwtSecret);
+      userId = payload.sub;
+    } catch {
+      res.status(400).json({ error: 'Invalid or expired reset link. Please request a new one.' });
+      return;
     }
 
-    const passwordHash = await bcrypt.hash(password, 10);
-    await supabase.from('auth_users').update({
-      password_hash: passwordHash,
-      reset_token: null,
-      reset_token_expires: null,
-    }).eq('id', row.id);
+    if (!userId) {
+      res.status(400).json({ error: 'Invalid reset token. Please request a new one.' });
+      return;
+    }
+
+    // Update the password via Supabase Admin API.
+    const { error: updateErr } = await supabase.auth.admin.updateUserById(userId, { password });
+    if (updateErr) throw updateErr;
 
     res.json({ ok: true });
   } catch (error) {
@@ -839,7 +765,8 @@ app.delete('/api/users/:id', async (req, res) => {
     const { error: delProfile } = await supabase.from('users').delete().eq('id', u.id);
     if (delProfile) throw delProfile;
     if (u.auth_id) {
-      await supabase.from('auth_users').delete().eq('id', u.auth_id);
+      // Remove the Supabase Auth account (ignores "user not found" silently).
+      await supabase.auth.admin.deleteUser(u.auth_id);
     }
     res.json({ ok: true });
   } catch (error) {
@@ -868,12 +795,8 @@ app.post('/api/notifications', async (req, res) => {
       .maybeSingle();
     let email = null;
     if (recipient?.auth_id) {
-      const { data: au } = await supabase
-        .from('auth_users')
-        .select('email')
-        .eq('id', recipient.auth_id)
-        .maybeSingle();
-      email = au?.email || null;
+      const { data: { user: authUser } } = await supabase.auth.admin.getUserById(recipient.auth_id);
+      email = authUser?.email || null;
     }
 
     let emailSent = false;
@@ -926,13 +849,16 @@ app.post('/api/notify/librarians', async (req, res) => {
       res.json({ ok: true, sent: 0 }); return;
     }
 
-    const authIds = librarians.map(l => l.auth_id).filter(Boolean);
-    const { data: authRows } = await supabase
-      .from('auth_users')
-      .select('email')
-      .in('id', authIds);
-
-    const emails = (authRows || []).map(r => r.email).filter(Boolean);
+    // Resolve each librarian's email from Supabase Auth.
+    const emailResults = await Promise.all(
+      librarians
+        .filter(l => l.auth_id)
+        .map(async l => {
+          const { data: { user: authUser } } = await supabase.auth.admin.getUserById(l.auth_id);
+          return authUser?.email || null;
+        })
+    );
+    const emails = emailResults.filter(Boolean);
     if (emails.length === 0) { res.json({ ok: true, sent: 0 }); return; }
 
     const appUrl = APP_BASE_URL || '';
@@ -1141,12 +1067,8 @@ async function runOverdueNotifications() {
 
       let email = null;
       if (tx.users?.auth_id) {
-        const { data: au } = await supabase
-          .from('auth_users')
-          .select('email')
-          .eq('id', tx.users.auth_id)
-          .maybeSingle();
-        email = au?.email || null;
+        const { data: { user: authUser } } = await supabase.auth.admin.getUserById(tx.users.auth_id);
+        email = authUser?.email || null;
       }
 
       let emailSent = false;
@@ -1339,16 +1261,6 @@ async function runColumnMigrations() {
       check: () => supabase.from('notifications').select('fine_id').limit(1),
       sql: 'ALTER TABLE notifications ADD COLUMN IF NOT EXISTS fine_id text REFERENCES fines(id) ON DELETE SET NULL;',
       label: 'notifications.fine_id',
-    },
-    {
-      check: () => supabase.from('auth_users').select('reset_token').limit(1),
-      sql: 'ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS reset_token text;',
-      label: 'auth_users.reset_token',
-    },
-    {
-      check: () => supabase.from('auth_users').select('reset_token_expires').limit(1),
-      sql: 'ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS reset_token_expires timestamptz;',
-      label: 'auth_users.reset_token_expires',
     },
     {
       check: () => supabase.from('fine_policy').select('max_borrow_count').limit(1),

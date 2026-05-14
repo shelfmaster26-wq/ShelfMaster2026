@@ -1,42 +1,38 @@
 import React, { useEffect, useState } from 'react';
-import { Link, useNavigate, useSearchParams } from 'react-router-dom';
-import { localDb } from './localDbClient';
+import { Link, useNavigate } from 'react-router-dom';
 import myLogo from './assets/logo.png';
 import { FaCheck, FaExclamationTriangle, FaEnvelope } from 'react-icons/fa';
 
 export default function VerifyEmail() {
-  const [params]  = useSearchParams();
   const navigate  = useNavigate();
   const [status,  setStatus]  = useState('pending'); // 'pending' | 'ok' | 'error'
   const [message, setMessage] = useState('Confirming your email…');
   const [countdown, setCountdown] = useState(3);
 
   useEffect(() => {
-    const token = params.get('token');
-    if (!token) {
+    // Supabase verifies the email server-side and redirects here with the result
+    // in the URL hash: /verify#access_token=...&type=signup
+    const hash   = window.location.hash.slice(1); // remove leading '#'
+    const params = new URLSearchParams(hash);
+    const type   = params.get('type');
+    const token  = params.get('access_token');
+    const errDesc = params.get('error_description');
+
+    if (errDesc) {
       setStatus('error');
-      setMessage('Missing verification token. Please use the link from your email.');
-      return;
+      setMessage(errDesc || 'Verification failed. Please request a new link.');
+    } else if (type === 'signup' && token) {
+      setStatus('ok');
+      setMessage('Your email has been confirmed successfully!');
+    } else if (type === 'recovery') {
+      // Recovery link landed here by mistake — send user to reset page
+      setStatus('error');
+      setMessage('That link is for resetting your password, not verifying email. Use the link in your password-reset email.');
+    } else {
+      setStatus('error');
+      setMessage('Missing or invalid verification token. Please use the link from your email.');
     }
-
-    let cancelled = false;
-    (async () => {
-      const result = await localDb.auth.verifyEmail(token);
-      if (cancelled) return;
-
-      if (result?.error) {
-        setStatus('error');
-        setMessage(result.error.message || 'Could not verify your email.');
-      } else if (result?.alreadyVerified) {
-        setStatus('ok');
-        setMessage('Your email was already confirmed. You can sign in now.');
-      } else {
-        setStatus('ok');
-        setMessage('Your email has been confirmed successfully!');
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [params]);
+  }, []);
 
   // Countdown redirect on success
   useEffect(() => {

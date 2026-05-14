@@ -269,11 +269,10 @@ export const localDb = {
       };
     },
 
-    verifyEmail: async (token) => {
-      return apiRequest('/api/auth/verify', {
-        method: 'POST',
-        body: JSON.stringify({ token }),
-      });
+    verifyEmail: async () => {
+      // Verification is handled by Supabase before the user lands on /verify.
+      // The hash fragment (#access_token=...&type=signup) confirms success.
+      return { ok: true };
     },
 
     resendVerification: async (email) => {

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Link, useNavigate, useSearchParams } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import myLogo from './assets/logo.png';
 import Toast from './Toast';
 import { useResponsive } from './useResponsive';
@@ -7,8 +7,7 @@ import { getBaseURL } from './connectionManager';
 import { FaCheckCircle, FaEye, FaEyeSlash } from 'react-icons/fa';
 
 export default function ResetPassword() {
-  const [searchParams]          = useSearchParams();
-  const token                   = searchParams.get('token') || '';
+  const [token,    setToken]    = useState('');
   const [password, setPassword] = useState('');
   const [confirm, setConfirm]   = useState('');
   const [loading, setLoading]   = useState(false);
@@ -23,15 +22,23 @@ export default function ResetPassword() {
   const closeToast = () => setToast({ message: '' });
 
   useEffect(() => {
-    if (!token) {
+    // Supabase delivers the recovery token in the URL hash after the user clicks
+    // the password-reset email link: /reset-password#access_token=...&type=recovery
+    const hash   = window.location.hash.slice(1);
+    const params = new URLSearchParams(hash);
+    const type   = params.get('type');
+    const access = params.get('access_token');
+    if (type === 'recovery' && access) {
+      setToken(access);
+    } else {
       showToast('Invalid reset link. Please request a new one.', 'error');
     }
-  }, [token]);
+  }, []);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
     if (!token) { showToast('Invalid reset link. Please request a new one.', 'error'); return; }
-    if (password.length < 6) { showToast('Password must be at least 6 characters.', 'warning'); return; }
+    if (password.length < 8) { showToast('Password must be at least 8 characters.', 'warning'); return; }
     if (password !== confirm) { showToast('Passwords do not match.', 'warning'); return; }
 
     setLoading(true);
